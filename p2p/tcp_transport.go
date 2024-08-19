@@ -1,9 +1,10 @@
 package p2p
 
 import (
+	"errors"
+	"io"
 	"log"
 	"net"
-	"sync"
 )
 
 type TCPPeer struct {
@@ -18,25 +19,37 @@ func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
 	}
 }
 
-type TCPTransport struct {
-	listenAddr string
-	listener   net.Listener
-	shakeHands HandshakeFunc
-	decoder    Decoder
-	mu         sync.RWMutex
-	peers      map[net.Addr]Peer
+func (slf *TCPPeer) Close() error {
+	return slf.conn.Close()
 }
 
-func NewTCPTransport(listenAddr string) *TCPTransport {
+type TCPTransportOpts struct {
+	ListenAddr string
+	Handshake  HandshakeFunc
+	Decoder    Decoder
+	OnPeer     func(Peer) error
+}
+
+type TCPTransport struct {
+	TCPTransportOpts
+	listener net.Listener
+	rpcCh    chan RPC
+}
+
+func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
 	return &TCPTransport{
-		listenAddr: listenAddr,
-		shakeHands: NOPHandshakeFunc,
+		TCPTransportOpts: opts,
+		rpcCh:            make(chan RPC),
 	}
+}
+
+func (slf *TCPTransport) Consume() <-chan RPC {
+	return slf.rpcCh
 }
 
 func (slf *TCPTransport) ListenAndAccept() error {
 	var err error
-	slf.listener, err = net.Listen("tcp", slf.listenAddr)
+	slf.listener, err = net.Listen("tcp", slf.ListenAddr)
 	if err != nil {
 		return err
 	}
@@ -56,20 +69,30 @@ func (slf *TCPTransport) startAcceptLoop() {
 	}
 }
 
-type Temp struct{}
-
 func (slf *TCPTransport) handleConn(conn net.Conn) {
+	var err error
 	peer := NewTCPPeer(conn, true)
-	if err := slf.shakeHands(peer); err != nil {
-		log.Printf("handshake failed: %s\n", err)
-		_ = conn.Close()
+	defer func() {
+		log.Printf("dropping peer connection: %s\n", err)
+		peer.Close()
+	}()
+	if err = slf.Handshake(peer); err != nil {
 		return
 	}
-	msg := &Temp{}
+	if slf.OnPeer != nil {
+		if err = slf.OnPeer(peer); err != nil {
+			return
+		}
+	}
+	rpc := RPC{From: conn.RemoteAddr()}
 	for {
-		if err := slf.decoder.Decode(conn, msg); err != nil {
+		if err = slf.Decoder.Decode(conn, &rpc); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				break
+			}
 			log.Printf("TCP decode error: %s\n", err)
 			continue
 		}
+		slf.rpcCh <- rpc
 	}
 }
